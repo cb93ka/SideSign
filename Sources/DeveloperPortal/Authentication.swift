@@ -767,6 +767,29 @@ public extension DeveloperPortal {
             return "1"
         }()
 
+        // SMS the way isideload (MIT, github.com/nab138/isideload) asks for it, which works where the plist "put" request below
+        // stopped working: a GET of GrandSlam's secondaryAuth URL with the 2FA headers but no plist content headers.
+        if requestedMode == "sms" {
+            var smsRequest = makeTwoFactorAuthRequest(url: Constants.URLs.secondaryAuth, context: context)
+            smsRequest.httpMethod = "GET"
+            smsRequest.setValue(nil, forHTTPHeaderField: "Accept")
+            smsRequest.setValue(nil, forHTTPHeaderField: "Content-Type")
+            smsRequest.setValue(customHeaders.grandSlam.userAgent, forHTTPHeaderField: "User-Agent")
+            smsRequest.setValue(nil, forHTTPHeaderField: "X-Apple-I-DSID")
+            debugLog("[SideSign] Requesting SMS code (GET secondaryAuth)...")
+            let (smsData, smsResponse) = try await session.data(for: smsRequest)
+            let smsStatus = (smsResponse as? HTTPURLResponse)?.safeStatusCode ?? 0
+            if smsStatus == HTTPStatusCodes.tooManyRequests {
+                throw DeveloperPortalError.tooManyAttempts(cause: "Verification codes cannot be sent to this phone number at this time. Please try again later.")
+            }
+            guard (200..<300).contains(smsStatus) else {
+                debugLog("[SideSign] SMS code request failed (HTTP \(smsStatus))")
+                throw ServerError.badServerResponse(reason: HTTPStatusCodes.localizedDescription(for: smsStatus), jsonPayload: prettyJSONString(from: smsData))
+            }
+            let numbers = knownPhoneNumbers.isEmpty ? [TrustedPhoneNumber(id: sanitizedPhoneID, number: "")] : knownPhoneNumbers
+            return TwoFactorAuthPhoneCodeResponse(phoneID: sanitizedPhoneID, activeMode: "sms", phoneNumbers: numbers, statusCode: smsStatus)
+        }
+
         let serverInfo: [String: any Sendable] = [
             "mode": requestedMode,
             "phoneNumber.id": sanitizedPhoneID
@@ -886,6 +909,37 @@ public extension DeveloperPortal {
                                       mode: String,
                                       context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
     {
+        if mode == "sms" {
+            // isideload's way: the code as JSON to /auth/verify/phone/securitycode; success is any 2xx, and the sign-in then starts over
+            // (the caller does that), Apple trusting this machine from then on.
+            var smsVerify = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCodeJSON, context: context)
+            smsVerify.httpMethod = "POST"
+            smsVerify.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            smsVerify.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
+            smsVerify.setValue(customHeaders.grandSlam.userAgent, forHTTPHeaderField: "User-Agent")
+            smsVerify.setValue(nil, forHTTPHeaderField: "X-Apple-I-DSID")
+            let phoneNumericID = Int(phoneID) ?? 1
+            smsVerify.httpBody = try JSONSerialization.data(withJSONObject: [
+                "securityCode": ["code": code],
+                "phoneNumber": ["id": phoneNumericID],
+                "mode": "sms"
+            ])
+            debugLog("[SideSign] Verifying SMS code (JSON)...")
+            let (smsData, smsResponse) = try await session.data(for: smsVerify)
+            let smsStatus = (smsResponse as? HTTPURLResponse)?.safeStatusCode ?? 0
+            if (200..<300).contains(smsStatus) { return .success }
+            if smsStatus == HTTPStatusCodes.tooManyRequests {
+                throw DeveloperPortalError.tooManyAttempts(cause: "Too many verification code attempts. Please try again later.")
+            }
+            var message = "Incorrect verification code."
+            if let json = try? JSONSerialization.jsonObject(with: smsData) as? [String: Any],
+               let errors = json["serviceErrors"] as? [[String: Any]], let first = errors.first {
+                message = (first["message"] as? String) ?? (first["title"] as? String) ?? message
+            }
+            debugLog("[SideSign] SMS code rejected (HTTP \(smsStatus)): \(message)")
+            if smsStatus == 400 || smsStatus == 401 || smsStatus == 403 || smsStatus == 412 { return .retry(message: message) }
+            throw ServerError.badServerResponse(reason: message, jsonPayload: prettyJSONString(from: smsData))
+        }
         var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context)
         verifyRequest.httpMethod = "POST"
         verifyRequest.httpBody = try PropertyListSerialization.data(fromPropertyList: [
