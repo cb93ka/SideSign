@@ -169,6 +169,7 @@ public enum GrandSlamAuthErrorCodes {
     public static let incorrectVerificationCode           = -21669
     public static let tooManyCodesRequested               = -20102
     public static let tooManyAttempts                     = -21668
+    public static let stepUpVerificationRequired          = -22411
     public static let rateLimited                         = -22411
 }
 

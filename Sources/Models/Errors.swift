@@ -28,6 +28,7 @@ public enum DeveloperPortalError: Error, LocalizedError, Sendable {
     case invalidProvisioningProfileIdentifier(String)
     case provisioningProfileDoesNotExist(identifier: String)
     case requiresTwoFactorAuthentication
+    case stepUpTwoFactorRequired(cause: String? = nil)
     case userCancelled
     case incorrectVerificationCode(cause: String? = nil)
     case authenticationHandshakeFailed(cause: String)
@@ -58,6 +59,7 @@ public enum DeveloperPortalError: Error, LocalizedError, Sendable {
         case .invalidProvisioningProfileIdentifier(let id):     return "The identifier for the requested provisioning profile is invalid: '\(id)'"
         case .provisioningProfileDoesNotExist(let id):          return "There is no provisioning profile with identifier '\(id)' on this team."
         case .requiresTwoFactorAuthentication:                  return "This account requires signing in with two-factor authentication."
+        case .stepUpTwoFactorRequired(let cause):               return cause ?? "Two-factor authentication is required to complete this action."
         case .userCancelled:                                    return "The operation was cancelled by the user."
         case .incorrectVerificationCode(let cause):             return cause ?? "Incorrect verification code."
         case .tooManyAttempts(let cause):                       return cause

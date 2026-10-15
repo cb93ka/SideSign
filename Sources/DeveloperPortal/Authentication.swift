@@ -287,7 +287,14 @@ public extension DeveloperPortal {
             "u": dsid
         ]
 
-        let fetchedToken = try await fetchAuthToken(app: app, parameters: appTokensParameters, sessionKey: sessionKey, anisetteData: anisetteData)
+        let fetchedToken = try await fetchAuthToken(
+            app: app,
+            parameters: appTokensParameters,
+            sessionKey: sessionKey,
+            anisetteData: anisetteData,
+            context: twoFactorAuthContext,
+            verificationHandler: verificationHandler
+        )
         let session = Session(
             dsid: dsid,
             authToken: fetchedToken.token,
@@ -371,6 +378,8 @@ public extension DeveloperPortal {
                 throw DeveloperPortalError.appSpecificPasswordRequired(cause: errorDesc)
             case GrandSlamAuthErrorCodes.incorrectVerificationCode:
                 throw DeveloperPortalError.incorrectVerificationCode(cause: errorDesc)
+            case GrandSlamAuthErrorCodes.stepUpVerificationRequired:
+                throw DeveloperPortalError.stepUpTwoFactorRequired(cause: errorDesc)
             default:
                 throw ServerError.underlyingError(code: errorCode, message: errorDesc ?? "Authentication failed")
             }
@@ -386,8 +395,64 @@ public extension DeveloperPortal {
         let timeToLive: TimeInterval?
     }
 
-    private func fetchAuthToken(app: String, parameters: [String: any Sendable], sessionKey: Data, anisetteData: AnisetteData) async throws -> FetchedAuthToken {
-        let responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisetteData)
+    private func fetchAuthToken(
+        app: String,
+        parameters: [String: any Sendable],
+        sessionKey: Data,
+        anisetteData: AnisetteData,
+        context: TwoFactorAuthContext,
+        verificationHandler: VerificationHandler?
+    ) async throws -> FetchedAuthToken {
+        var responseDictionary: [String: any Sendable]
+        do {
+            responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisetteData)
+        } catch DeveloperPortalError.stepUpTwoFactorRequired(let cause) {
+            guard let verificationHandler else {
+                debugLog("[SideSign] Step-up 2FA (-22411) required but no verificationHandler provided")
+                throw DeveloperPortalError.requiresTwoFactorAuthentication
+            }
+
+            debugLog("[SideSign] Step-up 2FA (-22411) triggered: \(cause ?? ""). Prompting user for 6-digit trusted device code...")
+            var currentRequest: TwoFactorRequest = .trustedDevice(error: nil)
+            var stepUpSuccess = false
+
+            for attempt in 1...3 {
+                let response = try await verificationHandler(currentRequest)
+                switch response {
+                case .verificationCode(let code):
+                    debugLog("[SideSign] Submitting step-up 2FA code (attempt \(attempt))...")
+                    let result = try await validateTrustedDevice2FACode(code: code, context: context)
+                    switch result {
+                    case .success:
+                        debugLog("[SideSign] Step-up 2FA code verified successfully with Apple!")
+                        stepUpSuccess = true
+                    case .retry(let message):
+                        debugLog("[SideSign] Step-up 2FA code rejected by Apple: \(message). Prompting retry...")
+                        currentRequest = .trustedDevice(error: message)
+                    }
+                case .cancel:
+                    debugLog("[SideSign] User cancelled step-up 2FA.")
+                    throw DeveloperPortalError.userCancelled
+                default:
+                    debugLog("[SideSign] Unsupported 2FA response during step-up: \(response)")
+                    throw DeveloperPortalError.invalid2FAResponse(cause: "Unsupported 2FA response")
+                }
+
+                if stepUpSuccess {
+                    break
+                }
+            }
+
+            guard stepUpSuccess else {
+                throw DeveloperPortalError.incorrectVerificationCode(cause: "Failed to verify 2FA code after 3 attempts.")
+            }
+
+            // Allow Apple session state to propagate across GSA endpoints
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+            debugLog("[SideSign] Retrying apptokens request after step-up 2FA...")
+            responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisetteData)
+        }
 
         guard let encryptedToken = responseDictionary["et"] as? Data else {
             let payload = prettyJSONString(from: responseDictionary)
@@ -798,7 +863,11 @@ public extension DeveloperPortal {
 
     private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
         var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context)
+        verifyRequest.httpMethod = "POST"
+        verifyRequest.httpBody = Data()
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
+        verifyRequest.setValue(customHeaders.grandSlam.userAgent, forHTTPHeaderField: "User-Agent")
+        verifyRequest.setValue(context.dsid, forHTTPHeaderField: "X-Apple-I-DSID")
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
             verboseLog("[SideSign] validateTrustedDevice2FACode HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
@@ -843,16 +912,20 @@ public extension DeveloperPortal {
     {
         let verifyDictionary = parsePlistOrJSON(data)
         let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
-        let errorCode = verifyDictionary?["ec"] as? Int ?? 0
-        let statusDict = verifyDictionary?["Status"] as? [String: any Sendable]
-        let errorMsg = (verifyDictionary?["em"] as? String)
-                    ?? (statusDict?["em"] as? String)
+        let responseDict = (verifyDictionary?["Response"] as? [String: any Sendable]) ?? verifyDictionary
+        let statusDict = (responseDict?["Status"] as? [String: any Sendable]) ?? (verifyDictionary?["Status"] as? [String: any Sendable])
+        let errorCode = (statusDict?["ec"] as? Int)
+                     ?? (responseDict?["ec"] as? Int)
+                     ?? (verifyDictionary?["ec"] as? Int)
+                     ?? 0
+        let errorMsg = (statusDict?["em"] as? String)
+                    ?? (responseDict?["em"] as? String)
+                    ?? (verifyDictionary?["em"] as? String)
                     ?? xmluiMessage
                     ?? xmluiTitle
 
         if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
             || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited
             || statusCode == HTTPStatusCodes.tooManyRequests
         {
             let msg = errorMsg ?? "Too many verification code attempts. Please try again later."
@@ -874,7 +947,7 @@ public extension DeveloperPortal {
             throw DeveloperPortalError.invalid2FAResponse(cause: message)
         }
 
-        guard statusCode == HTTPStatusCodes.ok else {
+        guard statusCode == HTTPStatusCodes.ok || statusCode == HTTPStatusCodes.noContent else {
             let rawStr = prettyJSONString(from: data)
             let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
             debugLog("[SideSign] 2FA verification failed (HTTP \(statusCode)): \(reason) - body: \(rawStr)")
@@ -908,6 +981,7 @@ public extension DeveloperPortal {
             "X-Apple-App-Info": h.grandSlam.authApp,
             "X-Xcode-Version": context.xcodeVersion,
             "X-Apple-Identity-Token": encodedIdentityToken,
+            "X-Apple-I-DSID": context.dsid,
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
             "X-Mme-Device-Id": a.deviceID,
