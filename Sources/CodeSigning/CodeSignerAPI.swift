@@ -60,6 +60,14 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
         self.keyStore = keyStore
     }
 
+    /// Capabilities turned on for the App ID on the developer portal (e.g. with GetMoreRam) that the app's own
+    /// signature never had: kept from the profile anyway, or turning them on would have no effect.
+    static let profileOnlyEntitlements: Set<String> = [
+        "com.apple.developer.kernel.increased-memory-limit",
+        "com.apple.developer.kernel.increased-debugging-memory-limit",
+        "com.apple.developer.kernel.extended-virtual-addressing",
+    ]
+
     public func signApp(at appURL: URL, provisioningProfiles profiles: [ProvisioningProfile], progress: Progress? = nil) async throws
     {
         debugLog("[SideSign] AppBundleSigner.signApp called")
@@ -116,7 +124,8 @@ public struct AppBundleSigner: CodeSignerAPI, Sendable {
                     }
                 } else if key != "application-identifier"               &&
                           key != "com.apple.developer.team-identifier"  &&
-                          key != "get-task-allow" 
+                          key != "get-task-allow"                       &&
+                          !Self.profileOnlyEntitlements.contains(key)
                 {
                     filteredEntitlements.removeValue(forKey: key)
                 }
