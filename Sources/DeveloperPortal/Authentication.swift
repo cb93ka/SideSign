@@ -782,8 +782,22 @@ public extension DeveloperPortal {
                 "mode": "sms"
             ])
             debugLog("[SideSign] Requesting SMS code (PUT verify/phone)...")
-            let (smsData, smsResponse) = try await session.data(for: smsRequest)
-            let smsStatus = (smsResponse as? HTTPURLResponse)?.safeStatusCode ?? 0
+            var (smsData, smsResponse) = try await session.data(for: smsRequest)
+            var smsStatus = (smsResponse as? HTTPURLResponse)?.safeStatusCode ?? 0
+            // Apple answers the PUT with a bare 403 for some accounts; a GET of secondaryAuth without the content headers
+            // (what SideInstaller does) still sends the code to the default number.
+            if smsStatus == 403 && ((try? JSONSerialization.jsonObject(with: smsData)) as? [String: Any])?["serviceErrors"] == nil {
+                var authRequest = makeTwoFactorAuthRequest(url: Constants.URLs.secondaryAuth, context: context)
+                authRequest.httpMethod = "GET"
+                authRequest.setValue(nil, forHTTPHeaderField: "Accept")
+                authRequest.setValue(nil, forHTTPHeaderField: "Content-Type")
+                authRequest.setValue(customHeaders.grandSlam.userAgent, forHTTPHeaderField: "User-Agent")
+                authRequest.setValue(nil, forHTTPHeaderField: "X-Apple-I-DSID")
+                debugLog("[SideSign] SMS PUT got a bare 403, requesting the code through secondaryAuth...")
+                (smsData, smsResponse) = try await session.data(for: authRequest)
+                smsStatus = (smsResponse as? HTTPURLResponse)?.safeStatusCode ?? 0
+                if (200..<300).contains(smsStatus) { smsData = Data() }
+            }
             let smsJSON = (try? JSONSerialization.jsonObject(with: smsData)) as? [String: Any]
             let serviceError = (smsJSON?["serviceErrors"] as? [[String: Any]])?.first
             let errorCode = serviceError?["code"] as? String
