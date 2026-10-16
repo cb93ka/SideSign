@@ -54,7 +54,6 @@ public enum Constants {
         }
         public static let phoneSecurityCode         = URL(string: "\(phoneBase)/securitycode?referrer=/auth/verify/phone/put")!
         public static let phoneSecurityCodeJSON     = URL(string: "\(phoneBase)/securitycode")!
-        public static let secondaryAuth             = URL(string: "https://gsa.apple.com/auth")!
         public static let smsPut                    = URL(string: "https://gsa.apple.com/auth/verify/phone/put?mode=sms")!
         public static let appleAuthDevices          = URL(string: "https://idmsa.apple.com/appleauth/auth/devices")!
 
